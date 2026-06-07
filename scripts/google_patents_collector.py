@@ -116,11 +116,19 @@ class GooglePatentsCollector:
             resp = self.session.get(url, timeout=60)
             resp.raise_for_status()
             return resp.json()
-        except requests.RequestException as e:
-            print(f"[ERROR] Request failed: {e}")
-            return None
-        except json.JSONDecodeError as e:
-            print(f"[ERROR] JSON decode failed: {e}")
+        except (requests.RequestException, json.JSONDecodeError) as e:
+            print(f"[ERROR] Request failed (trying Browser fallback): {e}")
+            try:
+                from advanced.browser_renderer import render_page
+                html_content = render_page(url)
+                if html_content:
+                    # 嘗試從渲染出的 HTML 中解析 JSON (如果 API 返回的是內嵌 JSON)
+                    # 或是返回解析後的結構
+                    soup = BeautifulSoup(html_content, "lxml")
+                    # Placeholder: 當前僅能解析 HTML 結構或返回 raw html
+                    return {"results": {"cluster": []}, "html": html_content}
+            except Exception as e2:
+                print(f"[CRITICAL ERROR] Fallback failed: {e2}")
             return None
 
     def _extract_results(self, data: Optional[Dict]) -> List[Dict]:
