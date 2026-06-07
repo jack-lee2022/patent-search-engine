@@ -46,17 +46,27 @@ User Topic (Chinese or English)
     ↓
 KeywordTranslator ──→ LLM translation + Entity extraction + Manual fallback map
     ↓
-Search Queries ──→ [technical keywords] + [entity:CompanyName] markers
+SynonymExpander ──→ Synonyms + Hyponyms + Hypernyms + Boolean OR groups
+    ↓
+BooleanQueryBuilder ──→ AND / OR / NOT + field filters (IPC/CPC/date/country/assignee)
+    ↓
+SearchQueryComposer ──→ Purpose-aware config (novelty/fto/invalidity/landscape)
     ↓
 ProxyManager ──→ Tor SOCKS5 rotation / direct / future: residential proxy
     ↓
-GooglePatentsCollector ──→ XHR API (list + detail + images + PDF)
+GooglePatentsCollector / EPOOPSCollector
     ↓
 ResultMerger ──→ Cross-query dedup + relevance scoring + family aggregation
+    ↓
+ClassificationAnalyzer ──→ IPC/CPC extraction + frequency analysis + reverse search
     ↓
 PatentDB ──→ SQLite with ON CONFLICT upsert
     ↓
 Enricher ──→ Claims, description, citation count, image URLs, PDF URL
+    ↓
+PatentFilter ──→ Layer 1 (abstract) → Layer 2 (claims) → Layer 3 (description)
+    ↓
+Search Report / Structured Analysis
 ```
 
 ---
@@ -128,7 +138,165 @@ result = collector.smart_search("tongue pressure", max_results=100)
 
 ---
 
-### 2. KeywordTranslator
+### 2. SynonymExpander
+
+**Step 2: "Extract technical features and build keywords"**—extends `KeywordTranslator` with multi-dimensional term expansion.
+
+**Expansion types**:
+
+| Type | Direction | Example |
+|------|-----------|---------|
+| **Synonym** | Same level | `"negative pressure"` ↔ `"vacuum"`, `"suction"` |
+| **Hyponym** | Narrower | `"sensor"` → `"piezoelectric pressure sensor"` |
+| **Hypernym** | Broader | `"piezoelectric pressure sensor"` → `"sensor"` |
+| **Related** | Technical domain | `"tongue pressure"` → `"oral pressure"`, `"lingual pressure"` |
+
+**Usage**:
+```python
+from synonym_expander import SynonymExpander
+
+expander = SynonymExpander()
+expanded = expander.expand(["tongue pressure", "sensor"])
+# → {"tongue pressure": ["oral pressure", "lingual pressure", ...],
+#    "sensor": ["pressure sensor", "force sensor", ...]}
+
+# Generate Boolean OR groups
+from boolean_query_builder import BooleanQueryBuilder, SearchQueryComposer
+composer = SearchQueryComposer()
+queries = composer.compose(
+    keywords=["tongue pressure"],
+    synonyms=expanded,
+    ipc="A61B5/00",
+    country="US",
+)
+# → queries["google_patents"] = "(tongue pressure OR oral pressure OR lingual pressure) AND classification/ipc:A61B5/00 AND country:US"
+```
+
+---
+
+### 3. BooleanQueryBuilder
+
+**Step 4: "Combine search terms and execute search"**—constructs patent-database-compatible Boolean queries.
+
+**Supported operators**:
+
+| Operator | Google Patents | EPO OPS | USPTO |
+|----------|---------------|---------|-------|
+| AND | `AND` (implicit space) | `AND` | `AND` |
+| OR | `OR` | `OR` | `OR` |
+| NOT | `NOT` / `-` | `NOT` | `ANDNOT` |
+| Parentheses | `(...)` | `(...)` | `(...)` |
+| Field filters | `classification/ipc:`, `country:`, `after:`, `assignee:` | `ic=`, `pa=`, `pd>=`, `ti=` | `IC/`, `COUNTRY/`, `PD/`, `AN/` |
+
+**Fluent API**:
+```python
+from boolean_query_builder import BooleanQueryBuilder
+
+b = BooleanQueryBuilder()
+b.add_or(["negative pressure", "vacuum", "suction"])
+b.add_and("sensor")
+b.add_not("biomedical")
+b.add_ipc("A61B5/00")
+b.add_country("US")
+
+q = b.build_google_patents()
+# → "(negative pressure OR vacuum OR suction) AND sensor NOT biomedical AND classification/ipc:A61B5/00 AND country:US"
+
+q_epo = b.build_epo_ops()
+# → "(ti=negative pressure OR ab=negative pressure OR ti=vacuum OR ab=vacuum OR ...) AND ic=A61B5/00 AND pa=US"
+```
+
+---
+
+### 4. SearchQueryComposer
+
+**Purpose-aware search configuration**:
+
+| Purpose | Default filters | Use case |
+|---------|-----------------|----------|
+| `novelty` | All countries, all statuses, no date limit | Prior art search |
+| `fto` | Target countries, active only, last 20 years | Freedom-to-operate |
+| `invalidity` | All countries, all statuses, no date limit | Prior art for invalidation |
+| `landscape` | All countries, all statuses, last 10 years | Technology landscape |
+
+```python
+queries = composer.from_purpose(
+    purpose="fto",
+    keywords=["tongue pressure"],
+    synonyms={"tongue pressure": ["oral pressure"]},
+    cpc="A61B5/00",
+    target_countries=["US", "EP"],
+)
+```
+
+---
+
+### 5. GooglePatentsCollector
+
+**API endpoint**: `https://patents.google.com/xhr/query`
+
+**URL construction rule (CRITICAL)**:
+The `url` parameter accepts an **inner query string**. Do **NOT** double-encode:
+
+```python
+# CORRECT
+inner = urllib.parse.urlencode({
+    "q": query,
+    "language": "ENGLISH",
+    "type": "PATENT",
+    "num": str(num),
+    "page": str(page),
+})
+params = urllib.parse.urlencode({"url": inner})
+
+# WRONG (double-encodes)
+encoded_query = urllib.parse.quote(query)
+params = urllib.parse.urlencode({
+    "url": f"q={encoded_query}&language=ENGLISH..."
+})
+```
+
+**Verify**:
+```python
+parsed = urllib.parse.parse_qs(urllib.parse.parse_qs(parsed.query)['url'][0])
+assert 'q' in parsed
+```
+
+**Search methods**:
+- `fetch_list(assignee, ...)` — by assignee name
+- `fetch_by_keywords(query, ...)` — by keyword(s), supports single string or list
+- `fetch_by_ipc(ipc_code, ...)` — by IPC/CPC classification
+- **`search_preview(query)`** — preview total result count without downloading (fetches 1 item only)
+- **`smart_search(query, ...)`** — preview → suggest refinements → fetch & sort by relevance
+
+**Smart search flow**:
+```python
+collector = GooglePatentsCollector()
+result = collector.smart_search("tongue pressure", max_results=100)
+# If result["status"] == "preview":
+#   result["total_found"] = 1247
+#   result["suggestions"] = [
+#       "tongue pressure device",
+#       "tongue pressure classification/ipc:A61B5/00",
+#       "tongue pressure after:2015-01-01",
+#   ]
+# If result["status"] == "success":
+#   result["items"] = [...]  # already sorted by relevance
+```
+
+**Session headers**:
+```python
+{
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 ... Chrome/120.0.0.0 Safari/537.36",
+    "Accept": "application/json",
+}
+```
+
+**Rate limiting**: 0.5–1.0s delay between requests. Use `time.sleep(REQUEST_DELAY)`.
+
+---
+
+### 6. KeywordTranslator
 
 **Four-layer fallback strategy**:
 
@@ -155,9 +323,9 @@ def extract_entities(topic: str) -> List[str]:
 
     # 2. English phrases inside parentheses
     paren_pattern = re.findall(
-        r'[\(（]([A-Za-z][A-Za-z0-9\s\-/]+(?:Device|System|Apparatus|Instrument|'
+        r'[\(\uff08]([A-Za-z][A-Za-z0-9\s\-/]+(?:Device|System|Apparatus|Instrument|'
         r'Meter|Gauge|Tool|Method|Technology|Ltd|Limited|Inc|Co\.?|Corp\.?|'
-        r'LLC|GmbH|AG|KK|株式会社)?)[\)）]',
+        r'LLC|GmbH|AG|KK|株式会社)?)[\)\uff09]',
         topic
     )
 
@@ -203,7 +371,7 @@ queries = [
 
 ---
 
-### 3. ProxyManager
+### 7. ProxyManager
 
 **Tor setup**:
 ```bash
@@ -234,7 +402,7 @@ residential proxies (not included in this skill yet).
 
 ---
 
-### 4. ResultMerger
+### 8. ResultMerger
 
 **Dual-track search strategy** (when entities detected):
 
@@ -278,7 +446,49 @@ for item in items:
 
 ---
 
-### 5. PatentDB (SQLite)
+### 9. ClassificationAnalyzer
+
+**Step 3: "Use IPC / CPC classification codes"**—extracts, analyzes, and reverse-searches by classification.
+
+**Reverse search loop**:
+```
+1. Seed search by keywords → 20 patents
+2. Extract IPC/CPC codes from seeds
+3. Analyze frequency → top 3 IPC + top 3 CPC
+4. Reverse search by top codes → more patents
+5. Merge and deduplicate
+```
+
+```python
+from classification_analyzer import ClassificationAnalyzer
+
+analyzer = ClassificationAnalyzer()
+
+# Extract from seed patents
+codes = analyzer.extract_from_items(seed_items)
+print(codes.top_ipc(3))   # [("A61B5/00", 12), ("A61B5/01", 8), ...]
+print(codes.top_cpc(3))   # [("A61B5/0245", 5), ...]
+
+# Recommend from keywords
+rec = analyzer.recommend_from_keywords(["tongue pressure", "sensor"])
+print(rec["ipc"])   # ["A61B5/00", "A61B5/01"]
+
+# Full reverse search
+result = analyzer.reverse_search(
+    collector,
+    keywords=["tongue pressure"],
+    seed_max_results=20,
+    top_n_ipc=3,
+    top_n_cpc=3,
+)
+print(f"Seed: {len(result['seed_items'])}")
+print(f"Reverse: {len(result['reverse_items'])}")
+print(f"Merged: {len(result['merged_items'])}")
+```
+
+---
+
+### 10. PatentDB (SQLite)
 
 **Schema** (`patents` table):
 ```sql
@@ -324,6 +534,59 @@ binding fails silently → `insert_patent()` returns False → 0 patents stored 
 "LLM analysis failed" even though the search found results.
 
 **Always audit dict keys against INSERT SQL columns after any schema change.**
+
+---
+
+### 11. PatentFilter
+
+**Step 5: "Screen, read, and analyze results"**—three-layer filtering system.
+
+```
+Input: 500 patents
+    ↓
+Layer 1: Abstract + Title screening
+    - Relevance score ≥ threshold (default 0.3)
+    - Fast pass/fail
+    → 150 patents
+    ↓
+Layer 2: Independent Claims analysis
+    - Extract independent claims
+    - Match target technical features
+    - Purpose-aware: FTO (any match = potential infringement)
+    → 40 patents
+    ↓
+Layer 3: Detailed Description
+    - Feature presence in description
+    - Detail level: word count, figure references, embodiment refs
+    - Minimum detail score (default 0.5)
+    → 25 patents
+```
+
+```python
+from patent_filter import PatentFilter
+
+filter = PatentFilter()
+result = filter.filter_pipeline(
+    items,
+    keywords=["tongue pressure", "sensor"],
+    target_features=["tongue", "pressure", "sensor", "measurement"],
+    purpose="fto",        # or "novelty", "invalidity"
+    l1_threshold=0.3,
+    l2_min_match=1,
+    l3_min_detail=0.5,
+)
+
+print(result["stats"])
+# {
+#   "input": 500,
+#   "layer1_pass": 150,
+#   "layer2_pass": 40,
+#   "layer3_pass": 25,
+#   "rejection_reasons": {"layer1": 350, "layer2": 110, "layer3": 15}
+# }
+
+print(PatentFilter.generate_filter_report(result))
+```
 
 ---
 
@@ -578,6 +841,10 @@ Use the template in `templates/search_report_template.md`.
 
 - `scripts/google_patents_collector.py` — Reference implementation of collector (includes `search_preview` & `smart_search`)
 - `scripts/keyword_translator.py` — Reference implementation of translator
+- `scripts/synonym_expander.py` — Synonym/hyponym/hypernym expansion for keyword enrichment
+- `scripts/boolean_query_builder.py` — Boolean query builder (AND/OR/NOT) for Google Patents, EPO OPS, USPTO (includes `SearchQueryComposer` for purpose-aware configs)
+- `scripts/classification_analyzer.py` — IPC/CPC extraction, frequency analysis, and reverse search loop
+- `scripts/patent_filter.py` — Three-layer filtering (abstract → claims → description)
 - `scripts/proxy_manager.py` — Tor setup, rotation, health check
 - `scripts/result_merger.py` — Deduplication, filtering, relevance scoring
 - `scripts/epo_ops_collector.py` — EPO OPS collector with OAuth & query builder
@@ -637,9 +904,14 @@ enricher.enrich(db, limit=50)
 
 ## Version History
 
-- **v1.0.2** (2026-06-07): Added `SearchManager` with `search_preview()` and `smart_search()` for volume control,
+- **v1.0.3** (2026-06-07): Added `BooleanQueryBuilder`, `SynonymExpander`, `ClassificationAnalyzer`, `PatentFilter`,
+  `SearchQueryComposer`. Full coverage of patent search 5-step workflow:
+  (1) purpose-aware search config, (2) synonym/hyponym expansion, (3) IPC/CPC reverse search loop,
+  (4) Boolean query construction (AND/OR/NOT) for Google Patents/EPO OPS/USPTO,
+  (5) three-layer filtering (abstract → claims → description).
+- **v1.0.2** (2026-06-07): Added `search_preview()` and `smart_search()` for volume control,
   4-dimension keyword refinement strategy (technical qualifier / IPC / date / country), and
-  human-in-the-loop interactive workflow. Documents the "result set too large" pitfall.
+  human-in-the-loop interactive workflow.
 - **v1.0.0** (2026-06-07): Google Patents primary, Tor proxy, keyword translation,
   entity extraction, dual-track search, result merging, SQLite storage.
   EPO OPS placeholder for future integration.
