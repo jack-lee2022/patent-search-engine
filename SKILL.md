@@ -11,7 +11,7 @@ description: >
   deduplication, and structured storage. Always consult this skill before
   attempting to write any patent collection code from scratch.
 category: patent-agent
-version: 1.0.0
+version: 1.0.2
 ---
 
 # Patent Search Engine
@@ -19,7 +19,7 @@ version: 1.0.0
 ## Overview
 
 A reproducible, multi-source patent search pipeline. **Primary source**: Google Patents
-internal XHR API. **Planned fallback**: EPO Open Patent Services (OPS).
+internal XHR API. **Implemented fallback**: EPO Open Patent Services (OPS) — `scripts/epo_ops_collector.py`.
 
 This skill encapsulates everything learned from production use on Oracle Cloud VMs
 (where Google Patents actively blocks cloud IPs), including all known pitfalls,
@@ -98,6 +98,23 @@ assert 'q' in parsed
 - `fetch_list(assignee, ...)` — by assignee name
 - `fetch_by_keywords(query, ...)` — by keyword(s), supports single string or list
 - `fetch_by_ipc(ipc_code, ...)` — by IPC/CPC classification
+- **`search_preview(query)`** — preview total result count without downloading (fetches 1 item only)
+- **`smart_search(query, ...)`** — preview → suggest refinements → fetch & sort by relevance
+
+**Smart search flow**:
+```python
+collector = GooglePatentsCollector()
+result = collector.smart_search("tongue pressure", max_results=100)
+# If result["status"] == "preview":
+#   result["total_found"] = 1247
+#   result["suggestions"] = [
+#       "tongue pressure device",
+#       "tongue pressure classification/ipc:A61B5/00",
+#       "tongue pressure after:2015-01-01",
+#   ]
+# If result["status"] == "success":
+#   result["items"] = [...]  # already sorted by relevance
+```
 
 **Session headers**:
 ```python
@@ -352,6 +369,131 @@ binding fails silently → `insert_patent()` returns False → 0 patents stored 
 | **Tor too slow for batch downloads** | 500KB PDF over Tor = 30s+ | Download PDFs directly (no proxy) if Google Patents CDN works; CDN often bypasses WAF |
 | **Assignee search noise** | `fetch_list(assignee="JMS")` returns ALL 50 patents, only 2 relevant | Use `_filter_by_keywords()` with threshold=1; or LLM relevance scoring |
 | **JSON not serializable** | numpy int32 from sklearn | Cast all numpy scalars: `int(x)`, `str(x)` before `json.dump` |
+| **Result set too large** | `max_results=100` truncates without relevance sorting | Use `search_preview()` → `smart_search()` with 4-dimension keyword refinement; see "Search Result Volume Management" below |
+
+---
+
+## Search Result Volume Management
+
+When a query returns hundreds or thousands of patents, blindly downloading the first 100 is wasteful and likely misses the most relevant ones. The skill provides a **preview → refine → confirm → download** workflow.
+
+### Current collector behavior
+
+| Component | Default limit | Truncation | Relevance sorting |
+|-----------|--------------|------------|-------------------|
+| `GooglePatentsCollector` | `max_results=100` | Hard cutoff | None (whatever API returns first) |
+| `EPOOPSCollector` | `max_results=100` | Hard cutoff | None (raw API order) |
+
+**Problem**: `max_results` only controls quantity, not quality. The first 100 may be noise.
+
+### The 4-dimension refinement strategy
+
+| Dimension | Technique | Typical reduction | Example |
+|-----------|-----------|-------------------|---------|
+| **1. Technical qualifier** | Add device / method / sensor / apparatus | 1,000 → 80 | `"tongue pressure"` → `"tongue pressure measurement device"` |
+| **2. IPC / CPC classification** | Use `fetch_by_ipc()` or `classification:` syntax | 1,000 → 150 | `classification/ipc:A61B5/00` |
+| **3. Assignee / entity** | Use `entity:CompanyName` + `fetch_list()` | 1,000 → 12 | `entity:JMS` |
+| **4. Date / country** | Add `after:YYYY`, `country:US` | 1,000 → 200 | `after:2020-01-01 country:US` |
+
+### Recommended workflow
+
+```
+User Topic: "tongue pressure measurement"
+    ↓
+[search_preview] → {total_found: 1247, warning: true}
+    ↓
+Show 4-dimension suggestions → user picks (or rejects)
+    ↓
+[search_preview with refined query] → {total_found: 89, warning: false}
+    ↓
+[smart_search] → download top 50 by relevance score
+```
+
+### Implementation: `search_preview()`
+
+```python
+class GooglePatentsCollector:
+    def search_preview(self, query: str) -> dict:
+        """Fetch only 1 item to determine total result count."""
+        url = self._build_keyword_url(query, page=0, num=1)
+        data = self._fetch_page(url)
+        total = data.get("results", {}).get("total_num_results", 0)
+        return {
+            "query": query,
+            "total_found": total,
+            "estimated_pages": (total + 24) // 25,
+            "warning": total > 200,
+        }
+```
+
+### Implementation: `smart_search()`
+
+```python
+class GooglePatentsCollector:
+    def smart_search(self, query: str, max_results: int = 100,
+                     relevance_threshold: float = 0.2,
+                     auto_limit: bool = True) -> dict:
+        """
+        1. Preview count
+        2. If too many, suggest refinements
+        3. If confirmed, fetch top-N by relevance
+        """
+        preview = self.search_preview(query)
+        
+        if auto_limit and preview["total_found"] > max_results * 2:
+            return {
+                "status": "preview",
+                "total_found": preview["total_found"],
+                "suggestions": self._generate_refinements(query),
+            }
+        
+        items = self.fetch_by_keywords(query, max_results=max_results)
+        
+        # Sort by relevance using ResultMerger
+        from result_merger import ResultMerger
+        items = ResultMerger.sort_by_relevance(items, [query])
+        scored = [
+            (item, ResultMerger.score_relevance(item, [query]))
+            for item in items
+        ]
+        
+        top_items = [
+            item for item, score in scored
+            if score >= relevance_threshold
+        ]
+        
+        return {
+            "status": "success",
+            "total_found": preview["total_found"],
+            "downloaded": len(top_items),
+            "items": top_items,
+        }
+    
+    @staticmethod
+    def _generate_refinements(query: str) -> list:
+        """Generate 4-dimension refinement suggestions."""
+        base = query.strip()
+        suggestions = []
+        if "device" not in base.lower() and "apparatus" not in base.lower():
+            suggestions.append(f"{base} device")
+            suggestions.append(f"{base} apparatus")
+        suggestions.append(f"{base} classification/ipc:A61B5/00")
+        suggestions.append(f"{base} after:2015-01-01")
+        suggestions.append(f"{base} country:US")
+        suggestions.append(f"{base} method")
+        suggestions.append(f"{base} sensor")
+        return suggestions
+```
+
+### Volume reference table
+
+| Search strategy | Expected results | Use case |
+|-----------------|-------------------|----------|
+| Broad technical term (e.g. `"tongue pressure"`) | 1,000–5,000 | Technology landscape scan |
+| Technical + device (e.g. `"tongue pressure device"`) | 100–500 | Product-oriented search |
+| Technical + assignee (e.g. `"tongue pressure"` + `JMS`) | 10–100 | Competitor analysis |
+| IPC + date range | 50–300 | Domain trend analysis |
+| Full combo (technical + IPC + date + country) | 5–50 | Core patent mining |
 
 ---
 
@@ -369,11 +511,14 @@ class EPOOPSCollector(BaseCollector): ...
 class LensOrgCollector(BaseCollector): ...
 ```
 
-**EPO OPS** (to be implemented):
+**EPO OPS** (`scripts/epo_ops_collector.py`):
 - Register: https://developers.epo.org/
 - Free tier: 1,000 requests/week
 - OAuth 2.0 (Client ID + Secret)
 - Endpoint: `https://ops.epo.org/3.2/rest-services/published-data/search`
+- **Search methods**: `search(query, max_results=100)` — full search with Range pagination
+- **`search_preview(query)`** — preview total count (fetches 1–1 Range, minimal rate-limit cost)
+- **Query builder**: `build_query(keywords, assignee, date_from, date_to)` — constructs EPO OPS query syntax
 
 **Why EPO OPS is the right fallback**:
 - Official API (no scraping fragility)
@@ -431,10 +576,11 @@ Use the template in `templates/search_report_template.md`.
 
 ## Scripts
 
-- `scripts/google_patents_collector.py` — Reference implementation of collector
+- `scripts/google_patents_collector.py` — Reference implementation of collector (includes `search_preview` & `smart_search`)
 - `scripts/keyword_translator.py` — Reference implementation of translator
 - `scripts/proxy_manager.py` — Tor setup, rotation, health check
 - `scripts/result_merger.py` — Deduplication, filtering, relevance scoring
+- `scripts/epo_ops_collector.py` — EPO OPS collector with OAuth & query builder
 - `scripts/search_report.py` — Report generator from DB
 
 ---
@@ -491,6 +637,9 @@ enricher.enrich(db, limit=50)
 
 ## Version History
 
+- **v1.0.2** (2026-06-07): Added `SearchManager` with `search_preview()` and `smart_search()` for volume control,
+  4-dimension keyword refinement strategy (technical qualifier / IPC / date / country), and
+  human-in-the-loop interactive workflow. Documents the "result set too large" pitfall.
 - **v1.0.0** (2026-06-07): Google Patents primary, Tor proxy, keyword translation,
   entity extraction, dual-track search, result merging, SQLite storage.
   EPO OPS placeholder for future integration.

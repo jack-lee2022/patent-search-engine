@@ -176,6 +176,100 @@ class GooglePatentsCollector:
             time.sleep(REQUEST_DELAY)
         return all_items[:max_results]
 
+    # -- Search preview & smart search --------------------------------------
+
+    def search_preview(self, query: str) -> dict:
+        """Preview total result count for a query without downloading all data.
+
+        Only fetches the first page (1 item) to read the total count from
+        Google Patents metadata. Useful for deciding whether to refine keywords.
+        """
+        url = self._build_keyword_url(query, page=0, num=1)
+        data = self._fetch_page(url)
+        if not data:
+            return {"query": query, "total_found": 0, "warning": False, "error": True}
+        results = data.get("results", {})
+        total = results.get("total_num_results", 0)
+        return {
+            "query": query,
+            "total_found": total,
+            "estimated_pages": (total + 24) // 25,
+            "warning": total > 200,
+            "error": False,
+        }
+
+    def smart_search(self, query: str, max_results: int = 100,
+                     relevance_threshold: float = 0.2,
+                     auto_limit: bool = True) -> dict:
+        """Smart search with preview, refinement suggestions, and relevance filtering.
+
+        Returns:
+            dict with keys:
+                - status: "preview" | "success" | "error"
+                - total_found: int (raw total from Google Patents)
+                - items: List[Dict] (only present when status="success")
+                - suggestions: List[str] (only present when status="preview")
+                - message: str (human-readable status)
+        """
+        # 1. Preview
+        preview = self.search_preview(query)
+        if preview.get("error"):
+            return {"status": "error", "message": "Preview request failed", "total_found": 0}
+
+        total = preview["total_found"]
+        print(f"[SMART SEARCH] Preview: {total} patents for '{query}'")
+
+        # 2. If too many, suggest refinements
+        if auto_limit and total > max_results * 2:
+            suggestions = self._generate_refinements(query)
+            return {
+                "status": "preview",
+                "total_found": total,
+                "message": f"Found {total} patents — too many. Consider refining with one of the suggestions below.",
+                "suggestions": suggestions,
+            }
+
+        # 3. Fetch and score
+        items = self.fetch_by_keywords(query, max_results=max_results)
+
+        # 4. Sort by relevance if keyword_translator available (optional)
+        try:
+            from result_merger import ResultMerger
+            items = ResultMerger.sort_by_relevance(items, [query])
+            # Filter by threshold
+            scored = [(item, ResultMerger.score_relevance(item, [query])) for item in items]
+            items = [item for item, score in scored if score >= relevance_threshold]
+        except ImportError:
+            pass
+
+        return {
+            "status": "success",
+            "total_found": total,
+            "downloaded": len(items),
+            "message": f"Downloaded {len(items)} of {total} patents (sorted by relevance).",
+            "items": items,
+        }
+
+    @staticmethod
+    def _generate_refinements(query: str) -> List[str]:
+        """Generate keyword refinement suggestions for overly broad queries."""
+        base = query.strip()
+        suggestions = []
+        # 1. Add device/apparatus qualifier
+        if "device" not in base.lower() and "apparatus" not in base.lower():
+            suggestions.append(f"{base} device")
+            suggestions.append(f"{base} apparatus")
+        # 2. Add IPC classification (common medical device class)
+        suggestions.append(f"{base} classification/ipc:A61B5/00")
+        # 3. Add date filter (last 10 years)
+        suggestions.append(f"{base} after:2015-01-01")
+        # 4. Add country filter
+        suggestions.append(f"{base} country:US")
+        # 5. Add method/technology qualifier
+        suggestions.append(f"{base} method")
+        suggestions.append(f"{base} sensor")
+        return suggestions
+
     # -- Normalization ------------------------------------------------------
 
     @staticmethod

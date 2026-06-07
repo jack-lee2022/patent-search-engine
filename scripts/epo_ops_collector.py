@@ -158,6 +158,42 @@ class EPOOPSCollector:
             print(f"[EPO OPS ERROR] Failed to extract items: {e}")
             return []
 
+    # ── Search Preview ────────────────────────────────────────────────────
+
+    def search_preview(self, query: str) -> dict:
+        """Preview total result count for an EPO OPS query.
+
+        Fetches only the first 1-item range to read the total count from
+        the response metadata, without consuming the full rate limit.
+        """
+        try:
+            resp = self.session.get(
+                self.SEARCH_URL,
+                headers=self._get_auth_header(),
+                params={"q": query, "Range": "1-1"},
+                timeout=60,
+            )
+            resp.raise_for_status()
+        except requests.RequestException as e:
+            print(f"[EPO OPS PREVIEW ERROR] {e}")
+            return {"query": query, "total_found": 0, "warning": False, "error": True}
+
+        data = resp.json()
+        try:
+            root = data.get("ops:world-patent-data", {})
+            biblio = root.get("ops:biblio-search", {})
+            total = int(biblio.get("@total-result-count", 0))
+        except (ValueError, TypeError):
+            total = 0
+
+        return {
+            "query": query,
+            "total_found": total,
+            "estimated_pages": (total + 99) // 100,
+            "warning": total > 200,
+            "error": False,
+        }
+
     # ── Query Builder ─────────────────────────────────────────────────────
 
     @staticmethod
