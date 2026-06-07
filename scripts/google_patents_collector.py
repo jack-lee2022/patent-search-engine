@@ -30,8 +30,17 @@ from bs4 import BeautifulSoup
 
 TOR_ENABLED = True
 TOR_PROXY = "socks5://127.0.0.1:9050"
-REQUEST_DELAY = 0.5
+REQUEST_DELAY = 1.0
 GOOGLE_PATENTS_URL = "https://patents.google.com/patent"
+
+try:
+    import sys
+    import os
+    sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+    from advanced.random_delay import human_like_sleep
+    HAS_RANDOM_DELAY = True
+except ImportError:
+    HAS_RANDOM_DELAY = False
 
 # ---------------------------------------------------------------------------
 # Collector
@@ -57,6 +66,13 @@ class GooglePatentsCollector:
             print(f"[COLLECTOR] Tor proxy enabled: {TOR_PROXY}")
         else:
             print("[COLLECTOR] Direct connection (no proxy)")
+
+    def _sleep(self):
+        """Execute delay between requests."""
+        if HAS_RANDOM_DELAY:
+            human_like_sleep(mu=8.0, sigma=3.0)  # Conservative human speed
+        else:
+            self._sleep()
 
     # -- URL builders -------------------------------------------------------
 
@@ -133,7 +149,7 @@ class GooglePatentsCollector:
             if len(items) < per_page:
                 break
             page += 1
-            time.sleep(REQUEST_DELAY)
+            self._sleep()
         return all_items[:max_results]
 
     def fetch_by_keywords(self, query: str, max_results: int = 100) -> List[Dict]:
@@ -156,7 +172,7 @@ class GooglePatentsCollector:
                 if len(items) < per_page:
                     break
                 page += 1
-                time.sleep(REQUEST_DELAY)
+                self._sleep()
             print(f"[KEYWORD] query='{q}' contributed {query_items} items")
         return all_items[:max_results]
 
@@ -173,7 +189,7 @@ class GooglePatentsCollector:
             if len(items) < per_page:
                 break
             page += 1
-            time.sleep(REQUEST_DELAY)
+            self._sleep()
         return all_items[:max_results]
 
     # -- Search preview & smart search --------------------------------------
