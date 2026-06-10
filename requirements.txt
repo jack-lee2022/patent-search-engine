@@ -1,0 +1,26 @@
+# patent-search-engine — Python dependencies
+# Install: pip install -r requirements.txt
+
+# ── HTTP / Web ──────────────────────────────────────────────────────────────
+requests>=2.31.0
+requests[socks]          # SOCKS5 proxy support (needed for Tor)
+beautifulsoup4>=4.12.0
+lxml>=4.9.0
+
+# ── Browser Automation (anti-bot bypass) ────────────────────────────────────
+playwright>=1.40.0       # run: playwright install chromium  (after pip install)
+playwright-stealth>=2.0.0
+
+# ── Tor Proxy Control ───────────────────────────────────────────────────────
+stem>=1.8.2              # Python Tor controller (NEWNYM circuit rotation)
+PySocks>=1.7.1           # SOCKS proxy socket support
+
+# ── AI / LLM ────────────────────────────────────────────────────────────────
+anthropic>=0.34.0        # Claude API (synonym expansion, claim analysis)
+
+# ── Document Processing ─────────────────────────────────────────────────────
+Pillow>=10.0.0           # image handling
+img2pdf>=0.5.1           # TIFF → PDF (EPO OPS fullimage)
+
+# ── Data / Utilities ────────────────────────────────────────────────────────
+tqdm>=4.66.0             # progress bars

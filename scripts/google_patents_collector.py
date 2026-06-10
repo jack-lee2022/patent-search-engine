@@ -119,14 +119,10 @@ class GooglePatentsCollector:
         except (requests.RequestException, json.JSONDecodeError) as e:
             print(f"[ERROR] Request failed (trying Browser fallback): {e}")
             try:
-                from advanced.browser_renderer import render_page
-                html_content = render_page(url)
-                if html_content:
-                    # 嘗試從渲染出的 HTML 中解析 JSON (如果 API 返回的是內嵌 JSON)
-                    # 或是返回解析後的結構
-                    soup = BeautifulSoup(html_content, "lxml")
-                    # Placeholder: 當前僅能解析 HTML 結構或返回 raw html
-                    return {"results": {"cluster": []}, "html": html_content}
+                from advanced.browser_renderer import fetch_api_json
+                data = fetch_api_json(url)
+                if data:
+                    return data
             except Exception as e2:
                 print(f"[CRITICAL ERROR] Fallback failed: {e2}")
             return None
@@ -372,7 +368,12 @@ class GooglePatentsDetailEnricher:
             resp = self.session.get(url, timeout=40)
             resp.raise_for_status()
         except requests.RequestException as e:
-            print(f"[DETAIL ERROR] {patent_id}: {e}")
+            print(f"[DETAIL ERROR] {patent_id}: {e} — trying browser fallback")
+            try:
+                from advanced.browser_renderer import get_patent_detail
+                return get_patent_detail(patent_id)
+            except Exception as e2:
+                print(f"[DETAIL CRITICAL] browser fallback failed: {e2}")
             return None
 
         soup = BeautifulSoup(resp.text, "lxml")
@@ -462,7 +463,15 @@ class PatentPDFDownloader:
             if detail:
                 pdf_url = detail.get("pdf_url")
         if not pdf_url:
-            print(f"[PDF] {patent_id}: no PDF URL")
+            # Final fallback: browser-based PDF URL extraction
+            try:
+                from advanced.browser_renderer import get_patent_pdf_url
+                print(f"[PDF] {patent_id}: trying browser fallback for PDF URL")
+                pdf_url = get_patent_pdf_url(patent_id)
+            except Exception as e:
+                print(f"[PDF] {patent_id}: browser fallback failed: {e}")
+        if not pdf_url:
+            print(f"[PDF] {patent_id}: no PDF URL found")
             return None
 
         try:
